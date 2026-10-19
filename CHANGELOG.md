@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.22.0] - 2026-10-19
+
+### Added
+- **Zero-Wake Hybrid GPU Architecture**: Prevents waking discrete GPUs (NVIDIA/AMD) from `D3cold` / runtime PM suspended states. Checks kernel in-memory runtime power status via `/sys/bus/pci/devices/<id>/power/runtime_status` with zero PCIe bus resumes or hardware latency spikes.
+- **WSL2 First-Class Isolation**: Dedicated hardware resolution path for Windows Subsystem for Linux (WSL2) via CPU iGPU tables and Windows host `nvidia-smi` bridge, permanently eliminating the virtualized `Microsoft Direct3D` fallback without invoking `nvidia-smi` on bare-metal Linux.
+- **Suspended PCI Display Guard**: Protects PCI display probing and DRM hwmon frequency reads by verifying that underlying controllers are active before querying sysfs or triggering `lspci`.
+
+### Packaging
+- Synchronized version 0.22.0 across Cargo, RPM, openSUSE OBS, Debian changelog, Arch Linux PKGBUILD, KISS Linux, Nix, Gentoo ebuild, Alpine APKBUILD, Void template, Homebrew formula, and Scoop manifest.
+
 ## [0.21.0] - 2026-10-09
 
 ### Added

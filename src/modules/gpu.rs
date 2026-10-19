@@ -445,8 +445,57 @@ pub fn parse_lspci_mm_output(text: &str) -> Vec<String> {
     gpus
 }
 
+/// Returns true if running inside Windows Subsystem for Linux (WSL2).
+pub fn is_wsl() -> bool {
+    fs::read_to_string("/proc/version")
+        .map(|v| v.contains("microsoft") || v.contains("WSL"))
+        .unwrap_or(false)
+        || std::env::var_os("WSL_DISTRO_NAME").is_some()
+        || Path::new("/dev/dxg").exists()
+}
+
+/// Checks if a PCI device directory in sysfs is currently in runtime PM suspended state.
+/// Reading `power/runtime_status` is handled in-memory by the kernel PM core and never wakes the bus.
+pub fn is_pci_device_suspended(pci_dev_path: &Path) -> bool {
+    fs::read_to_string(pci_dev_path.join("power/runtime_status"))
+        .map(|s| {
+            let trimmed = s.trim();
+            trimmed == "suspended" || trimmed == "suspending"
+        })
+        .unwrap_or(false)
+}
+
+/// Checks if any PCI display controller (class 0x03xxxx) in the given PCI directory is currently suspended.
+pub fn has_suspended_pci_display_in_dir(pci_dir: &Path) -> bool {
+    if let Ok(entries) = fs::read_dir(pci_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if let Ok(class_str) = fs::read_to_string(path.join("class")) {
+                let trimmed = class_str.trim().to_lowercase();
+                if (trimmed.starts_with("0x03") || trimmed.starts_with("3"))
+                    && is_pci_device_suspended(&path)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Checks if any PCI display controller is currently in runtime PM suspended state.
+pub fn has_suspended_pci_display() -> bool {
+    has_suspended_pci_display_in_dir(Path::new("/sys/bus/pci/devices"))
+}
+
 /// Fallback probe using `lspci -mm` when sysfs does not yield specific models.
 pub fn detect_gpus_lspci() -> Vec<String> {
+    // If any PCI display device is suspended in D3cold, running lspci reads its config space
+    // and forces a hardware PCIe bus resume. Respect the runtime PM power-saving state.
+    if has_suspended_pci_display() {
+        return Vec::new();
+    }
+
     let mut gpus = Vec::new();
     for class_filter in &["::0300", "::0302", "::0380"] {
         if let Ok(output) = crate::modules::system_command("lspci")
@@ -925,9 +974,20 @@ pub fn group_and_index_gpus(raw_gpus: &[String], cpu_sockets: usize) -> Vec<Modu
 /// Probes maximum graphics clock frequency (in MHz) from sysfs DRM and hwmon entries.
 pub fn detect_gpu_clock_mhz(card_idx: usize) -> Option<u64> {
     let card_dir = format!("/sys/class/drm/card{}", card_idx);
+    let card_path = Path::new(&card_dir);
+    if !card_path.exists() {
+        return None;
+    }
+
+    // If this DRM card's underlying PCI device is sleeping in D3cold, do not query hwmon.
+    let dev_path = card_path.join("device");
+    if is_pci_device_suspended(&dev_path) {
+        return None;
+    }
+
     // 1. Intel DRM gt frequencies (gt_max_freq_mhz, gt_boost_freq_mhz, gt_RP0_freq_mhz)
     for file in &["gt_max_freq_mhz", "gt_boost_freq_mhz", "gt_RP0_freq_mhz"] {
-        if let Ok(val) = fs::read_to_string(format!("{}/{}", card_dir, file)) {
+        if let Ok(val) = fs::read_to_string(card_path.join(file)) {
             if let Ok(mhz) = val.trim().parse::<u64>() {
                 if mhz > 0 {
                     return Some(mhz);
@@ -936,7 +996,7 @@ pub fn detect_gpu_clock_mhz(card_idx: usize) -> Option<u64> {
         }
     }
     // 2. AMD / Generic hwmon freq1_max
-    if let Ok(entries) = fs::read_dir(format!("{}/device/hwmon", card_dir)) {
+    if let Ok(entries) = fs::read_dir(dev_path.join("hwmon")) {
         for entry in entries.flatten() {
             if let Ok(val) = fs::read_to_string(entry.path().join("freq1_max")) {
                 if let Ok(hz) = val.trim().parse::<u64>() {
@@ -1081,15 +1141,36 @@ fn get_gpu_list_uncached() -> Vec<String> {
         }
     }
 
+    // 1. WSL2 First-Class Path:
+    // When running inside WSL2, Hyper-V virtualizes PCI as "Microsoft Direct3D".
+    // Directly query the CPU iGPU table and Windows host nvidia-smi bridge.
+    if is_wsl() {
+        let wsl_gpus = detect_wsl_gpus();
+        if !wsl_gpus.is_empty() {
+            if let Some(ref dir) = cache_dir {
+                let _ = fs::create_dir_all(dir);
+            }
+            if let Some(ref path) = cache_file {
+                let payload = format!(
+                    "# FINGERPRINT:{}\n{}",
+                    current_fingerprint,
+                    wsl_gpus.join("\n")
+                );
+                let _ = fs::write(path, payload);
+            }
+            return wsl_gpus;
+        }
+    }
+
+    // 2. Native Bare-Metal Linux PCI Probing
     let sysfs_gpus = detect_gpus_sysfs();
 
-    // Check if sysfs produced only generic/unresolved IDs (e.g. "Intel (0x5917)" or "Microsoft Direct3D")
+    // Check if sysfs produced only generic/unresolved IDs (e.g. "Intel (0x5917)" or "Display Controller")
     let is_incomplete = sysfs_gpus.is_empty()
         || sysfs_gpus.iter().any(|g| {
             g.contains("0x")
                 || g.contains("PCI Display")
                 || g.contains("Display Controller")
-                || g.contains("Microsoft Direct3D")
                 || g == "Intel"
                 || g == "NVIDIA"
                 || g == "AMD"
@@ -1097,17 +1178,11 @@ fn get_gpu_list_uncached() -> Vec<String> {
         });
 
     let raw_list = if is_incomplete {
-        // If in WSL or Direct3D detected, probe WSL GPU bridge (iGPU + dGPU)
-        let wsl_gpus = detect_wsl_gpus();
-        if !wsl_gpus.is_empty() {
-            wsl_gpus
+        let lspci_gpus = detect_gpus_lspci();
+        if !lspci_gpus.is_empty() {
+            lspci_gpus
         } else {
-            let lspci_gpus = detect_gpus_lspci();
-            if !lspci_gpus.is_empty() {
-                lspci_gpus
-            } else {
-                sysfs_gpus
-            }
+            sysfs_gpus
         }
     } else {
         sysfs_gpus
@@ -1625,5 +1700,27 @@ mod tests {
             lookup_pci_ids_from_file(&pci_ids_path, "9999", "1234"),
             None
         );
+    }
+
+    #[test]
+    fn test_is_pci_device_suspended_and_display_guard() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let pci_dir = temp_dir.path();
+
+        let active_gpu = pci_dir.join("0000:01:00.0");
+        fs::create_dir_all(active_gpu.join("power")).unwrap();
+        fs::write(active_gpu.join("class"), "0x030000\n").unwrap();
+        fs::write(active_gpu.join("power/runtime_status"), "active\n").unwrap();
+
+        assert!(!is_pci_device_suspended(&active_gpu));
+        assert!(!has_suspended_pci_display_in_dir(pci_dir));
+
+        let sleeping_dgpu = pci_dir.join("0000:02:00.0");
+        fs::create_dir_all(sleeping_dgpu.join("power")).unwrap();
+        fs::write(sleeping_dgpu.join("class"), "0x030200\n").unwrap();
+        fs::write(sleeping_dgpu.join("power/runtime_status"), "suspended\n").unwrap();
+
+        assert!(is_pci_device_suspended(&sleeping_dgpu));
+        assert!(has_suspended_pci_display_in_dir(pci_dir));
     }
 }

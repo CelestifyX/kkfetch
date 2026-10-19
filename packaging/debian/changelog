@@ -1,3 +1,9 @@
+kkfetch (0.22.0-1~ppa1~noble) noble; urgency=medium
+
+  * Release version 0.22.0: Zero-wake hybrid GPU architecture, runtime PM D3cold protection, WSL2 isolation, and PCI display guard.
+
+ -- Kushagra Kumar <kkushagra86@gmail.com>  Mon, 19 Oct 2026 18:25:00 +0530
+
 kkfetch (0.21.0-1~ppa1~noble) noble; urgency=medium
 
   * Release version 0.21.0: Microsecond battery caching, CachyOS and multi-distro ASCII logos, high-refresh-rate EDID parsing, and expanded terminal font support.
